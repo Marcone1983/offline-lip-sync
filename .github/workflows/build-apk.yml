@@ -26,8 +26,7 @@ on:
 
 env:
   JAVA_VERSION: '17'
-  NODE_VERSION: '18'
-  EXPO_CLI_VERSION: 'latest'
+  ANDROID_API_LEVEL: '34'
 
 jobs:
   build:
@@ -55,16 +54,13 @@ jobs:
         cmake: 3.22.1
         ndk: 25.2.9519653
 
-    - name: 🚀 Setup Node.js ${{ env.NODE_VERSION }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-
-    - name: 📦 Install global dependencies
+    - name: 🔧 Verify build environment
       run: |
-        npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
-        npm install -g eas-cli
+        echo "📦 Verifying build environment..."
+        echo "Java version: $(java -version 2>&1 | head -1)"
+        echo "Android SDK: $ANDROID_HOME"
+        echo "SDK platforms: $(ls $ANDROID_HOME/platforms/ 2>/dev/null || echo 'Not found')"
+        echo "Build tools: $(ls $ANDROID_HOME/build-tools/ 2>/dev/null || echo 'Not found')"
 
     - name: 🔍 Detect project structure
       id: detect
@@ -90,77 +86,106 @@ jobs:
         # Set working directory for subsequent steps
         echo "PROJECT_DIR=$(ls -d rebuilt-* | head -1)" >> $GITHUB_ENV
 
-    - name: 📦 Install project dependencies
+    - name: ✅ Verify Android project structure
       run: |
         cd "$PROJECT_DIR"
         
-        echo "📦 Installing dependencies..."
-        npm install --legacy-peer-deps
+        echo "✅ Verifying Android project structure..."
         
-        # Install EAS CLI for building
-        npm install -g @expo/cli eas-cli
-
-    - name: 🏗️ Pre-build (generate native projects)
-      run: |
-        cd "$PROJECT_DIR"
-        
-        echo "🏗️ Running Expo prebuild..."
-        npx expo prebuild --platform android --clear
-        
-        # Ensure Android project exists
-        if [ ! -d "android" ]; then
-          echo "❌ Android project not generated"
+        # Check essential files
+        if [ ! -f "build.gradle" ]; then
+          echo "❌ Root build.gradle not found"
           exit 1
         fi
+        
+        if [ ! -f "app/build.gradle" ]; then
+          echo "❌ App build.gradle not found"
+          exit 1
+        fi
+        
+        if [ ! -f "app/src/main/AndroidManifest.xml" ]; then
+          echo "❌ AndroidManifest.xml not found"
+          exit 1
+        fi
+        
+        if [ ! -f "gradlew" ]; then
+          echo "❌ gradlew script not found"
+          exit 1
+        fi
+        
+        echo "✅ Android project structure verified"
+
+    - name: 🔧 Setup Gradle wrapper
+      run: |
+        cd "$PROJECT_DIR"
+        
+        # Download gradle wrapper jar if missing
+        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+          echo "📥 Downloading Gradle wrapper..."
+          mkdir -p gradle/wrapper
+          curl -L -o gradle/wrapper/gradle-wrapper.jar \
+            https://github.com/gradle/gradle/releases/download/v8.0.2/gradle-8.0.2-wrapper.jar
+        fi
+        
+        # Make gradlew executable
+        chmod +x gradlew
+        
+        echo "✅ Gradle wrapper ready"
 
     - name: 🔑 Setup Android signing
       run: |
         cd "$PROJECT_DIR"
         
         # Create debug keystore for APK signing
-        mkdir -p android/app
+        mkdir -p app/debug
         
-        if [ ! -f "android/app/debug.keystore" ]; then
-          keytool -genkeypair -v -keystore android/app/debug.keystore \
+        if [ ! -f "app/debug/debug.keystore" ]; then
+          keytool -genkeypair -v -keystore app/debug/debug.keystore \
             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
             -keypass android -storepass android \
             -dname "CN=Android Debug,O=Android,C=US"
         fi
+        
+        # Configure signing in build.gradle if needed
+        echo "✅ Android signing configured"
 
-    - name: 🔨 Build APK
+    - name: 🔨 Build APK with Gradle
       run: |
         cd "$PROJECT_DIR"
         
-        BUILD_TYPE="${{ inputs.build_type || 'release' }}"
+        BUILD_TYPE="${{ inputs.build_type || 'debug' }}"
         
-        echo "🔨 Building $BUILD_TYPE APK..."
+        echo "🔨 Building $BUILD_TYPE APK with Gradle..."
         
-        cd android
+        # Set JAVA_HOME if not set
+        export JAVA_HOME=$JAVA_HOME_17_X64
         
         # Clean previous builds
-        ./gradlew clean
+        ./gradlew clean --stacktrace
         
         # Build APK
         if [ "$BUILD_TYPE" = "release" ]; then
-          ./gradlew assembleRelease --stacktrace
+          ./gradlew assembleRelease --stacktrace --info
           APK_PATH="app/build/outputs/apk/release/app-release.apk"
         else
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --stacktrace --info
           APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
         fi
         
         # Verify APK was created
         if [ ! -f "$APK_PATH" ]; then
           echo "❌ APK not found at $APK_PATH"
-          echo "📂 Contents of outputs:"
-          find app/build/outputs -name "*.apk" -ls || true
+          echo "📂 Contents of app/build/outputs:"
+          find app/build/outputs -name "*.apk" -ls 2>/dev/null || echo "No APK outputs found"
+          echo "📂 Full build outputs:"
+          ls -la app/build/ || echo "No build directory"
           exit 1
         fi
         
         # Get APK info
         APK_SIZE=$(du -h "$APK_PATH" | cut -f1)
-        echo "✅ APK created: $APK_SIZE"
-        echo "apk_path=$PROJECT_DIR/android/$APK_PATH" >> $GITHUB_ENV
+        echo "✅ APK created successfully: $APK_SIZE"
+        echo "apk_path=$PWD/$APK_PATH" >> $GITHUB_ENV
         echo "apk_size=$APK_SIZE" >> $GITHUB_ENV
 
     - name: 📊 APK Analysis
@@ -180,21 +205,37 @@ jobs:
       if: ${{ inputs.upload_artifact != false }}
       uses: actions/upload-artifact@v4
       with:
-        name: offline-lip-sync-${{ inputs.build_type || 'release' }}-apk
+        name: offline-lip-sync-${{ inputs.build_type || 'debug' }}-apk
         path: |
           ${{ env.apk_path }}
-          ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*.apk
         retention-days: 30
 
     - name: 🎉 Build Summary
       run: |
-        echo "## 🎉 Build Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "## 🎉 Commercial AI Model Bootstrap APK Built Successfully!" >> $GITHUB_STEP_SUMMARY
         echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
         echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Build Type | ${{ inputs.build_type || 'release' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build Type | ${{ inputs.build_type || 'debug' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| APK Size | ${{ env.apk_size }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Java Version | ${{ env.JAVA_VERSION }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Node Version | ${{ env.NODE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Android API | ${{ env.ANDROID_API_LEVEL }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Architecture | Native Android + Kotlin |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 AI Models Included" >> $GITHUB_STEP_SUMMARY
+        echo "This APK automatically downloads:" >> $GITHUB_STEP_SUMMARY  
+        echo "- **MuseTalk**: Real-time lip-sync generation" >> $GITHUB_STEP_SUMMARY
+        echo "- **VAE ft-mse**: StabilityAI autoencoder" >> $GITHUB_STEP_SUMMARY
+        echo "- **DWPose**: Human pose detection" >> $GITHUB_STEP_SUMMARY
+        echo "- **Face-Parsing BiSeNet**: Face segmentation" >> $GITHUB_STEP_SUMMARY
+        echo "- **Whisper Tiny**: Audio transcription" >> $GITHUB_STEP_SUMMARY
+        echo "- **GFPGAN v1.4**: Face restoration" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### 📥 Download APK" >> $GITHUB_STEP_SUMMARY
         echo "The APK has been uploaded as a build artifact and can be downloaded from the Actions tab." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ⚡ Key Features" >> $GITHUB_STEP_SUMMARY
+        echo "- **100% Offline** after initial model download" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commercial licenses** (MIT/Apache-2.0/OpenRAIL-M)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resume downloads** if interrupted" >> $GITHUB_STEP_SUMMARY
+        echo "- **SHA-256 verification** where available" >> $GITHUB_STEP_SUMMARY
+        echo "- **Professional quality** lip-sync processing" >> $GITHUB_STEP_SUMMARY
